@@ -1,0 +1,11 @@
+[package]
+name = "ntpqte"
+version = "0.1.0"
+edition = "2021"
+description = "ntpQTE — the constellation's clock daemon in Rust: a hand-welded NTP client, the council of clocks as a consensus, and a drift journal the ledger can row. no dependencies, show me the mechanism."
+license = "AGPL-3.0-only"
+
+[dependencies]
+
+[profile.release]
+lto = true
