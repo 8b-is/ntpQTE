@@ -9,7 +9,7 @@
 //!
 //! The offset math (classic NTP):
 //!   offset = ((t1 - t0) + (t2 - t3)) / 2
-//!   delay  = (t2 - t1) + (t3 - t0)
+//!   delay  = (t3 - t0) - (t2 - t1)
 //! where t0 = client send, t1 = server receive, t2 = server transmit,
 //! t3 = client receive. All in seconds on the client's own clock.
 
@@ -40,7 +40,7 @@ pub struct Packet {
 impl Packet {
     pub fn request(version: u8) -> Packet {
         Packet {
-            li_vn_mode: (3 << 3) | (version << 0) | 3, // NTP v3-style: li=0 … actually mode 3 (client) in the low bits
+            li_vn_mode: ((version & 0x07) << 3) | 3, // li=0, version in bits 3..5, mode=3 (client)
             ..Default::default()
         }
     }
@@ -108,7 +108,7 @@ impl Exchange {
     }
     /// The round-trip delay, seconds.
     pub fn delay(self) -> f64 {
-        (self.t2 - self.t1) + (self.t3 - self.t0)
+        (self.t3 - self.t0) - (self.t2 - self.t1)
     }
 }
 
@@ -142,7 +142,11 @@ fn now_unix_f64() -> f64 {
 /// milliseconds and the delay in milliseconds.
 pub fn query(server: &str, port: u16, timeout: std::time::Duration) -> io::Result<(f64, f64)> {
     let addrs: Vec<_> = (server, port).to_socket_addrs()?.collect();
-    let sock = UdpSocket::bind(("0.0.0.0", 0))?;
+    let addr = addrs.first().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "server resolved to no addresses"))?;
+    let bind_addr = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let sock = UdpSocket::bind(bind_addr)?;
+    // Connected UDP accepts datagrams only from the selected peer.
+    sock.connect(addr)?;
     sock.set_read_timeout(Some(timeout))?;
 
     let mut req = Packet::request(4).to_bytes();
@@ -150,12 +154,22 @@ pub fn query(server: &str, port: u16, timeout: std::time::Duration) -> io::Resul
     // set the transmit timestamp just before sending
     let tx = unix_to_ntp_ts(t0);
     req[40..48].copy_from_slice(&tx.to_be_bytes());
-    sock.send_to(&req, &addrs[0])?;
+    sock.send(&req)?;
 
     let mut buf = [0u8; PACKET_LEN];
-    let (n, _) = sock.recv_from(&mut buf)?;
+    let n = sock.recv(&mut buf)?;
     let t3 = now_unix_f64();
+    if n < PACKET_LEN {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "short NTP response"));
+    }
     let pkt = Packet::from_bytes(&buf[..n]);
+    let version = (pkt.li_vn_mode >> 3) & 0x07;
+    if pkt.li_vn_mode & 0x07 != 4 || !matches!(version, 3 | 4)
+        || pkt.li_vn_mode >> 6 == 3 || !(1..=15).contains(&pkt.stratum)
+        || pkt.orig_ts != tx || pkt.recv_ts == 0 || pkt.tx_ts == 0
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid or unrelated NTP response"));
+    }
 
     let t1 = ntp_ts_to_unix_f64(pkt.recv_ts);
     let t2 = ntp_ts_to_unix_f64(pkt.tx_ts);
@@ -205,6 +219,12 @@ mod tests {
     }
 
     #[test]
+    fn request_header_encodes_version_and_client_mode() {
+        assert_eq!(Packet::request(4).to_bytes()[0], 0x23);
+        assert_eq!(Packet::request(3).to_bytes()[0], 0x1b);
+    }
+
+    #[test]
     fn packet_roundtrip() {
         let p = Packet {
             li_vn_mode: 0x23, // version 4, mode 3 (client)
@@ -240,7 +260,7 @@ mod tests {
         // t0=0, t1=4, t2=6, t3=10: offset = ((4-0)+(6-10))/2 = 0
         let ex = Exchange { t0: 0.0, t1: 4.0, t2: 6.0, t3: 10.0 };
         assert!((ex.offset() * 1000.0).abs() < 1e-9);
-        assert!((ex.delay() - 12.0).abs() < 1e-9);
+        assert!((ex.delay() - 8.0).abs() < 1e-9);
         // a +20ms displacement: server timestamps shifted
         let ex2 = Exchange { t0: 0.0, t1: 4.02, t2: 6.02, t3: 10.0 };
         assert!((ex2.offset() * 1000.0 - 20.0).abs() < 1e-6);
@@ -263,5 +283,55 @@ mod tests {
         assert!(line.contains("\"server\":\"time.apple.com\""));
         assert!(line.contains("\"offset_ms\":21.90"));
         let _ = std::fs::remove_file(path);
+    }
+}
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn fixture(change: impl FnOnce(Packet) -> Vec<u8> + Send + 'static) -> io::Result<(f64, f64)> {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let port = server.local_addr().unwrap().port();
+        let peer = std::thread::spawn(move || {
+            let mut buf = [0u8; PACKET_LEN];
+            let (_, addr) = server.recv_from(&mut buf).unwrap();
+            let req = Packet::from_bytes(&buf);
+            let reply = Packet { li_vn_mode: 0x24, stratum: 2,
+                orig_ts: req.tx_ts, recv_ts: req.tx_ts, tx_ts: req.tx_ts,
+                ..Default::default() };
+            server.send_to(&change(reply), addr).unwrap();
+        });
+        let result = std::panic::catch_unwind(|| query("127.0.0.1", port, Duration::from_secs(2)));
+        peer.join().unwrap();
+        result.expect("query must not panic on network input")
+    }
+
+    #[test]
+    fn short_response_is_rejected() {
+        assert_eq!(fixture(|_| vec![0; 8]).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+    #[test]
+    fn mismatched_origin_is_rejected() {
+        assert_eq!(fixture(|mut p| { p.orig_ts ^= 1; p.to_bytes().to_vec() }).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+    #[test]
+    fn invalid_server_headers_are_rejected() {
+        for header in [0x23, 0xe4, 0x04] {
+            assert_eq!(fixture(move |mut p| { p.li_vn_mode = header; p.to_bytes().to_vec() }).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        }
+        for stratum in [0, 16] {
+            assert_eq!(fixture(move |mut p| { p.stratum = stratum; p.to_bytes().to_vec() }).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        }
+    }
+    #[test]
+    fn zero_server_timestamp_is_rejected() {
+        assert_eq!(fixture(|mut p| { p.tx_ts = 0; p.to_bytes().to_vec() }).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+    #[test]
+    fn valid_response_succeeds() {
+        let (offset, delay) = fixture(|p| p.to_bytes().to_vec()).unwrap();
+        assert!(offset.is_finite() && delay.is_finite());
     }
 }

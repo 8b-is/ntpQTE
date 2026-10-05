@@ -21,7 +21,7 @@ cargo test                                      # the corridor (packet · math �
 
 ```
 offset = ((t1 − t0) + (t2 − t3)) / 2     t0 client send · t1 server recv
-delay  = (t2 − t1) + (t3 − t0)           t2 server tx · t3 client recv
+delay  = (t3 − t0) − (t2 − t1)           t2 server tx · t3 client recv
 ```
 
 in `Exchange::offset` / `Exchange::delay`, test-pinned with fixtures.
